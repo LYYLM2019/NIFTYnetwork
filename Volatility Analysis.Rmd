@@ -1,0 +1,339 @@
+
+
+Import the libraries
+
+```{r}
+library("quantmod")
+library("purrr")
+library("rugarch")
+library("rmgarch")
+library("igraph")
+library("reshape2")
+library("ggplot2")
+library(sna)
+library(tsna)
+library(ndtv)
+```
+
+
+
+
+Import the symbols and returns data. As the dataset contains NA values corresponding to the non-trading holidays, we use na.omit to remove those rows from the dataset. 
+
+```{r}
+nifty50 <- read.csv(url("https://www1.nseindia.com/content/indices/ind_nifty50list.csv"))
+
+symbols <- as.vector(paste0(nifty50$Symbol, ".NS"))
+
+# Step 1: Download historical prices dataset from Yahoo Finance
+
+getSymbols(symbols,
+           from = "2013-01-01",
+           to = "2020-04-30", src="yahoo")
+
+prices <- data.frame(map(symbols,function(x) Ad(get(x))))
+
+prices <- na.omit(prices)
+
+# prices <- reduce(prices,merge)
+
+logPrices <- log(prices)
+
+
+# taking difference of logs of prices for calculating returns
+ret <- na.omit(diff(as.matrix(logPrices)))
+
+# Drop all the dataframes of individual stock information
+rm(list = ls(pattern = ".NS"))
+
+## Step 2: Convert daily historical data to weekly
+
+wkPrices <- apply.weekly(prices, colMeans)
+
+logWkPrices <- log(wkPrices)
+
+wkRet <- diff(as.matrix(logWkPrices))
+
+
+```
+To keep the datasize small, we use weekly returns. We also assume the same univariate model applies to all the constituent stocks for simplicity.
+
+
+```{r}
+#same univariate model for all 50 stocks
+returns = wkRet
+
+uspec.n = multispec(replicate(50,ugarchspec(mean.model = list(armaOrder = c(1,0)))))
+
+multf = multifit(uspec.n, returns)
+
+spec1 = dccspec(uspec = uspec.n, dccOrder = c(1,1), distribution = "mvnorm")
+
+
+fit1 = dccfit(spec1, data=returns, fit.control = list(eval.se = TRUE), fit=multf)
+
+cor1 = rcor(fit1)
+```
+
+We melt the correlation matrix into its long form so as to plot the histogram of correlations. This encompassess all pairwise correlations for all trading days in the period 01JAN2013 - 30APR2020.  
+
+```{r}
+long <- melt(cor1)
+
+ggplot(data=long, aes(value)) + 
+  geom_histogram(col="red", 
+                 fill="green", 
+                 alpha = .2) + 
+  labs(title="Histogram for Correlation") +
+  labs(x="Correlation", y="Freq")
+```
+
+
+save.image(file="volatility_analysis.RData")
+
+```{r}
+load("C:/Users/bagre/Documents/Volatility NIFTY/volatility_analysis.RData")
+```
+```{r}
+long <- long[long$value < 1,]
+med <- print(median(long$value))
+```
+
+Constructing networks for each day
+
+
+Constructing the network for the first day
+```{r}
+get_graph_metrics <- function(cutoff, cor1, start.date, end.date){
+
+#Initializing the vectors to store metrics  
+clust.avg <- c()
+clust.global <- c()
+edge.ratio <- c()
+new.links.formed <- c()
+prev.edges <- c()
+max.strength <- c()
+max.eigenvector <- c()
+max.eigenvalue <- c()
+p.value <- c()
+
+# Correlation matrix for day 1:
+links <- as.matrix(cor1[, , 1])
+
+max.eigenvalue <- append(max.eigenvalue, max(eigen(links)$value))
+
+links[links < cutoff] <- 0
+
+#Network on day 1
+net <- graph_from_adjacency_matrix(links, mode = "undirected", weighted = T, diag = F, add.colnames = T, add.rownames = F)
+
+#Calculate graph metrics for day 1
+clust.avg <- append(clust.avg,transitivity(net, type = "average"))
+clust.global <- append(clust.global,transitivity(net))
+edge.ratio <- append(edge.ratio, edge_density(net))
+new.links.formed <- append(new.links.formed, length(setdiff(E(net),prev.edges)) + length(setdiff(prev.edges,E(net))))
+
+#Node level metrics
+max.strength <- append(max.strength, max(strength(net)))
+max.eigenvector <- append(max.eigenvector, max(eigen_centrality(net, scale = F)$vector))
+
+#Get a check on how the degree distribution behaves
+y <- table(degree.distribution(net))
+x <- unique(degree.distribution(net))
+reg <- lm(log(y[x > 0])~log(x[x > 0]))
+p.value <- append(p.value, summary(reg)$coefficients[2,4])
+
+prev.edges <- E(net)
+
+
+for ( i in 2:dim(cor1)[3]){
+# Correlation matrix for day i:
+links <- as.matrix(cor1[, , i])
+
+eigenvalue <- if( is.null(max(eigen(links)$value)) ){
+  0
+}else{max(eigen(links)$value)}
+
+max.eigenvalue <- append(max.eigenvalue, eigenvalue)
+
+links[links < cutoff] <- 0
+
+#Network on day i
+net <- graph_from_adjacency_matrix(links, mode = "undirected", weighted = T, diag = F, add.colnames = T, add.rownames = F)
+
+#Calculate graph metrics on day i
+clust.avg <- append(clust.avg,transitivity(net, type = "average"))
+clust.global <- append(clust.global,transitivity(net))
+edge.ratio <- append(edge.ratio, edge_density(net))
+new.links.formed <- append(new.links.formed, length(setdiff(E(net),prev.edges)) + length(setdiff(prev.edges,E(net))))
+
+#Node level metrics on day i
+max.strength <- append(max.strength, max(strength(net)))
+max.eigenvector <- append(max.eigenvector, max(eigen_centrality(net, scale = F)$vector))
+
+#Get a check on how the degree distribution behaves
+y <- table(degree.distribution(net))
+x <- unique(degree.distribution(net))
+reg <- lm(log(y[x > 0])~log(x[x > 0]))
+p.value <- append(p.value, summary(reg)$coefficients[2,4])
+
+#Storing the edge list to get newly formed links
+prev.edges <- E(net)
+}
+
+#Add dates to the networks
+dates <- seq(start.date,end.date, by = "weeks")
+dates <- dates[2:length(dates)]
+
+#Store the metrics in a dataframe
+graph.metrics <- data.frame(date = dates,
+                            max.eigenvalue = max.eigenvalue,
+                            average.clustering = clust.avg,
+                            global.clustering = clust.global,
+                            edge.density = e.density,
+                            median.edge.ratio = edge.ratio,
+                            new.links.formed = new.links.formed,
+                            max.strength = max.strength,
+                            max.eigenvector = max.eigenvector,
+                            p.value = p.value)
+
+return(graph.metrics)
+}
+```
+
+```{r}
+start.date <- as.Date("2013-01-01")
+end.date <- as.Date("2020-04-30")
+graph.metrics <- get_graph_metrics(med, cor1, start.date, end.date)
+```
+
+```{r}
+ggplot() + geom_line(data = graph.metrics[2:nrow(graph.metrics),], aes(x = date, y = new.links.formed)) + scale_x_date(date_labels = "%Y-%b", breaks = "year")
+```
+
+```{r}
+ggplot() + geom_line(data = graph.metrics, aes(x = date, y = median.edge.ratio)) + scale_x_date(date_labels = "%Y-%b", breaks = "year")
+```
+
+```{r}
+ggplot() + geom_line(data = graph.metrics, aes(x = date, y = average.clustering)) + scale_x_date(date_labels = "%Y-%b", breaks = "year")
+```
+
+```{r}
+ggplot() + geom_line(data = graph.metrics, aes(x = date, y = global.clustering)) + scale_x_date(date_labels = "%Y-%b", breaks = "year")
+```
+
+```{r}
+ggplot() + geom_line(data = graph.metrics, aes(x = date, y = max.strength)) + scale_x_date(date_labels = "%Y-%b", breaks = "year")
+```
+
+```{r}
+ggplot() + geom_line(data = graph.metrics, aes(x = date, y = max.eigenvector)) + scale_x_date(date_labels = "%Y-%b", breaks = "year")
+```
+
+```{r}
+ggplot() + geom_line(data = graph.metrics, aes(x = date, y = p.value)) + scale_x_date(date_labels = "%Y-%b", breaks = "year")
+```
+
+```{r}
+ggplot() + geom_line(data = graph.metrics, aes(x = date, y = max.eigenvalue)) + scale_x_date(date_labels = "%Y-%b", breaks = "year")
+```
+
+Comparing the metrics with NIFTYVIX
+```{r}
+vix <- read.csv("NIFTYVIX.csv")
+vix <- xts(vix, as.Date(vix$Date, "%d-%m-%Y"))
+VIX.weekly <- data.frame(apply.weekly(vix$NIFTYVIX, mean))
+VIX.weekly$Date <- as.Date(row.names(VIX.weekly))
+VIX.weekly <- VIX.weekly[VIX.weekly$Date %in% start.date:end.date,]
+VIX.weekly <- VIX.weekly[2:nrow(VIX.weekly),]
+```
+
+```{r}
+reg <- lm(VIX.weekly$NIFTYVIX~graph.metrics$average.clustering + graph.metrics$global.clustering)
+summary(reg)
+```
+
+```{r}
+reg <- lm(VIX.weekly$NIFTYVIX~graph.metrics$median.edge.ratio)
+summary(reg)
+```
+
+```{r}
+reg <- lm(VIX.weekly$NIFTYVIX~graph.metrics$new.links.formed)
+summary(reg)
+```
+
+```{r}
+reg <- lm(VIX.weekly$NIFTYVIX~graph.metrics$median.edge.ratio + graph.metrics$average.clustering)
+summary(reg)
+```
+
+```{r}
+reg <- lm(VIX.weekly$NIFTYVIX~graph.metrics$edge.density)
+summary(reg)
+```
+
+```{r}
+reg <- lm(VIX.weekly$NIFTYVIX~graph.metrics$edge.density + graph.metrics$average.clustering)
+summary(reg)
+```
+
+```{r}
+reg <- lm(VIX.weekly$NIFTYVIX~graph.metrics$edge.density + graph.metrics$average.clustering + graph.metrics$max.strength)
+summary(reg)
+```
+
+```{r}
+reg <- lm(VIX.weekly$NIFTYVIX~graph.metrics$max.eigenvalue)
+summary(reg)
+```
+
+```{r}
+reg <- lm(VIX.weekly$NIFTYVIX~ graph.metrics$average.clustering + graph.metrics$max.strength + graph.metrics$max.eigenvalue)
+summary(reg)
+```
+
+Trying with different quantiles to see if the threshold leads to a better fit
+```{r}
+max.r <- 0
+for (i in seq(0.1,0.9,0.1)){
+  cutoff <- quantile(long$value,i)
+  
+  g.metrics <- get_graph_metrics(cutoff,cor1,start.date,end.date)
+  
+  reg.density <- lm(VIX.weekly$NIFTYVIX ~ g.metrics$edge.density)
+  reg.new.links <- lm(VIX.weekly$NIFTYVIX ~ g.metrics$new.links.formed)
+  reg.clustering <- lm(VIX.weekly$NIFTYVIX ~ g.metrics$average.clustering + g.metrics$global.clustering)
+  reg.local.metrics <- lm(VIX.weekly$NIFTYVIX ~ g.metrics$max.strength + g.metrics$max.eigenvector)
+  reg.maxeigenvalue <- lm(VIX.weekly$NIFTYVIX~g.metrics$max.eigenvalue)
+  reg.all <- lm(VIX.weekly$NIFTYVIX ~ g.metrics$max.strength + g.metrics$average.clustering + g.metrics$max.eigenvalue)
+  
+  adj.r.sq <- c(summary(reg.density)$adj.r.squared, summary(reg.new.links)$adj.r.squared, summary(reg.clustering)$adj.r.squared, summary(reg.local.metrics)$adj.r.squared, summary(reg.maxeigenvalue)$adj.r.squared, summary(reg.all)$adj.r.squared)
+  
+  if (max(adj.r.sq) >= max.r){
+    max.cutoff <- cutoff
+    max.r = max(adj.r.sq)
+    max.reg.summary <- switch (which.max(adj.r.sq),
+      summary(reg.density),
+      summary(reg.new.links),
+      summary(reg.clustering),
+      summary(reg.maxeigenvalue),
+      summary(reg.local.metrics),
+      
+      summary(reg.all)
+    )
+  }
+ 
+}
+```
+
+```{r}
+max.cutoff
+max.reg.summary
+```
+
+
+
+
+
